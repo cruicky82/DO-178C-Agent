@@ -1,0 +1,288 @@
+# DO-178C Agent Scalability Challenge — Conversation Record
+# Date: 2026-02-11
+# Participants: User (cruic), Antigravity AI Assistant
+# Purpose: Refine DO-178C skill for agent-driven requirements derivation at scale
+
+================================================================================
+## CONTEXT & STARTING POINT
+================================================================================
+
+The user has a DO-178C compliance skill (`do178c-dev`) for AI coding agents.
+The skill instructs agents to:
+1. Derive High-Level Requirements (HLRs) from system requirements
+2. Derive Low-Level Requirements (LLRs) from source code
+3. Generate test cases for each HLR
+4. Populate a SQLite traceability database
+5. Generate a Software Design Description (SDD)
+
+The skill was tested with Gemini 3 Flash on the kcnav application (~94 source files).
+
+================================================================================
+## PROBLEM: GEMINI 3 FLASH OUTPUT WAS POOR
+================================================================================
+
+### First Attempt (before pipeline changes):
+Database inspection of kcnav/docs/artefacts/traceability.db:
+
+| Metric                  | Expected     | Actual    | Coverage |
+|-------------------------|-------------|-----------|----------|
+| HLRs                   | ~15-20      | 11        | Acceptable |
+| LLRs                   | ~100-200+   | **6**     | **~3%**  |
+| Test Cases             | >=22        | **2**     | **~9%**  |
+| SDD Sections           | ~15+        | 5 (tiny)  | ~33%     |
+| Arch Decisions         | ~6-10       | 4         | Acceptable |
+| HLRs with 0 LLRs      | 0           | **7/11**  | **64% orphaned** |
+| HLRs with 0 Tests      | 0           | **9/11**  | **82% untested** |
+
+### Second Attempt (after pipeline changes to SKILL.md):
+Even worse. Only produced:
+- 1 System Requirement (SYS_REVNAV_001)
+- 4 HLRs (Initiation, Orchestration, Fusion, SORA)
+- 7 LLRs
+- 2 Architecture Decisions
+- 2 HLR Test Cases
+- 4 SDD Sections
+
+### Root Cause Analysis:
+1. **Context Window Exhaustion**: 94 files x 100-400 lines = too much for one session
+2. **"Single-Pass" Rule was Unrealistic**: Agent can't complete ALL artifacts in one session
+3. **No Incremental Progress Persistence**: No mechanism to resume
+4. **LLR Derivation is the Bottleneck**: Every function body needs pseudocode for every branch
+
+================================================================================
+## CHANGES MADE TO SKILL (ITERATION 1)
+================================================================================
+
+### SKILL.md Updates:
+1. §3.1 HLR Definition Rewrite:
+   - "Functions NOT Files" rule — HLRs describe behavioral capabilities
+   - HLR Quality Gate checklist (items a-j from DO-178C §5.1.2)
+   - HLR categories: functional, performance, interface, safety
+
+2. §3.2 Architecture Expansion:
+   - 6-step derivation process: data flow, control flow, partitioning,
+     resource constraints, interfaces, safety compatibility
+
+3. §2.3 Mode A Workflow Restructured:
+   - Old: Files → LLRs → Abstract HLRs
+   - New: Files → Identify Functions → Derive HLRs → LLRs → Tests
+
+4. §3.4 Derived Requirements (NEW):
+   - Process for non-traceable requirements
+   - is_derived flag + derivation_rationale
+
+5. §2.2 Replaced "Single-Pass" with "Pipeline Execution":
+   - 6-phase pipeline model
+   - Multi-session support
+   - Progress tracking via check_progress.py
+
+### Database Schema (init_db.py) Updates:
+- Added to high_level_requirements table:
+  - is_derived INTEGER DEFAULT 0
+  - derivation_rationale TEXT
+  - hlr_category TEXT CHECK('functional','performance','interface','safety')
+
+- NEW TABLE: source_inventory
+  CREATE TABLE source_inventory (
+      id            TEXT PRIMARY KEY,    -- 'file_path::function_name:Lnn'
+      file_path     TEXT NOT NULL,
+      function_name TEXT NOT NULL,
+      start_line    INTEGER,
+      end_line      INTEGER,
+      line_count    INTEGER,
+      has_llr       INTEGER DEFAULT 0,
+      parent_hlr    TEXT,
+      scanned_at    TEXT DEFAULT (datetime('now'))
+  );
+
+### New Scripts Created:
+
+1. scan_codebase.py (~350 lines):
+   - Regex-based function scanner for JS/TS/Go/Python
+   - Keyword filtering (excludes if/for/while from JS method detection)
+   - Idempotent UPSERT into source_inventory
+   - Support for --dry-run mode
+   - Tested on revcop: 69 functions from 11 files
+
+2. check_progress.py (~335 lines):
+   - Progress dashboard for all 6 pipeline phases
+   - Shows gaps, resume points, validation issues
+   - ASCII-safe output for Windows compatibility
+
+================================================================================
+## KEY INSIGHT: SKILLS ALONE ARE INSUFFICIENT FOR LIGHTER AGENTS
+================================================================================
+
+Even after the pipeline changes, Gemini 3 Flash still produced poor results.
+The fundamental problem:
+
+"Skill files are INSTRUCTIONS, but lighter agents need GUARDRAILS."
+
+A skill file says "do X" and hopes the agent does it completely.
+When it doesn't, there's no enforcement mechanism.
+
+### Why Skills Fail for Lighter Agents:
+| Problem                    | Root Cause                                          |
+|---------------------------|-----------------------------------------------------|
+| Shallow output (4 HLRs)  | Nothing enforces completeness                       |
+| Skipped phases            | Agent "forgets" steps 4-6 after context on 1-3     |
+| No resumability           | Each session starts fresh                           |
+| Quality variation         | Depends entirely on agent's per-token judgment      |
+
+================================================================================
+## PROPOSED SOLUTION: MOVE INTELLIGENCE FROM PROMPT → CODE
+================================================================================
+
+Instead of a skill file that says "derive LLRs for every branch", build a
+Python-based requirements derivation engine that:
+
+1. Auto-generates 80% of artifacts DETERMINISTICALLY from AST analysis
+2. Reduces the agent's role to parts needing genuine judgment
+3. Enforces completeness — script won't finish until every function has coverage
+
+### Architecture:
+
+┌──────────────────────────────────────────────────────┐
+│  derive_requirements.py  (THE HEAVY LIFTER)          │
+│                                                       │
+│  Phase 1: AST-parse all files → source_inventory     │
+│  Phase 2: Auto-generate LLR DRAFTS from code         │
+│     - Every function → 1 LLR with signature/purpose  │
+│     - Every if/else → branch LLR                     │
+│     - Every try/catch → error_handler LLR            │
+│  Phase 3: Cluster functions into HLR candidates      │
+│     - Group by behavioral similarity                  │
+│     - Generate HLR draft text                        │
+│  Phase 4: Generate test case skeletons per HLR       │
+│  Phase 5: Write everything to traceability.db        │
+│                                                       │
+│  Output: A populated DB with DRAFT-quality artifacts  │
+│          that an agent (or human) reviews & refines   │
+└──────────────────────────────────────────────────────┘
+
+### Script Breakdown:
+
+| Script              | Input              | Output                    | Agent Needed? |
+|---------------------|--------------------|-----------------------------|---------------|
+| scan_codebase.py    | Source root        | source_inventory            | No            |
+| derive_llrs.py      | Source files + AST | Draft LLRs w/ logic_type   | No — deterministic |
+| cluster_hlrs.py     | LLR drafts + calls | HLR candidate clusters     | Minimal — approve |
+| gen_test_cases.py   | HLRs              | Test case skeletons         | Minimal — review |
+| check_progress.py   | DB                 | Progress dashboard          | No            |
+| render_sdd.py       | DB                 | SDD.md                     | No            |
+
+### Agent's Reduced Role:
+1. Run the scripts
+2. Review the auto-generated drafts
+3. Refine HLR text to be properly quantitative
+4. Add architecture decisions (genuine judgment)
+5. Run validation
+
+================================================================================
+## LANGUAGE SUPPORT ANALYSIS
+================================================================================
+
+### Currently Supported (in scan_codebase.py):
+- JavaScript (.js, .jsx)
+- TypeScript (.ts, .tsx)
+- Go (.go)
+- Python (.py)
+
+### Rust (.rs) — Proposed Addition:
+
+Rust is IDEAL for this approach because:
+
+| Feature                        | Why It's Easy to Parse                         |
+|-------------------------------|------------------------------------------------|
+| fn name(args) -> ReturnType   | Clear, parseable function signatures           |
+| impl Block for Type           | Methods always in impl blocks                  |
+| match arms                    | Explicit pattern matching = auto branch LLRs   |
+| Result<T,E> / Option<T>       | Error paths in the type system                 |
+| pub / pub(crate)              | Visibility = interface vs internal             |
+| Traits                        | Natural HLR boundaries                         |
+| #[test]                       | Existing tests are discoverable                |
+
+Rust regex patterns:
+```python
+RUST_PATTERNS = [
+    # fn function_name(...)
+    re.compile(r'^\s*(?:pub(?:\(crate\))?\s+)?(?:async\s+)?fn\s+(\w+)\s*[<(]', re.MULTILINE),
+    # impl TypeName
+    re.compile(r'^\s*impl(?:<[^>]+>)?\s+(\w+)', re.MULTILINE),
+    # struct/enum/trait declarations
+    re.compile(r'^\s*(?:pub(?:\(crate\))?\s+)?(?:struct|enum|trait)\s+(\w+)', re.MULTILINE),
+]
+```
+
+For LLR derivation, Rust produces HIGHER quality drafts than JS because:
+- match statements → each arm = automatic branch LLR
+- impl blocks → natural function groupings for HLR clustering
+- Explicit error paths (Result::Err, Option::None) → auto error_handler LLRs
+- No ambiguous closures-as-methods — every function boundary is explicit
+
+================================================================================
+## FILES CREATED/MODIFIED IN THIS CONVERSATION
+================================================================================
+
+### Modified:
+- c:\Users\cruic\.gemini\antigravity\skills\do178c-dev\SKILL.md
+  - §2.1 Completeness Gate (line 32)
+  - §2.2 Single-Pass → Pipeline Execution (lines 34-61)
+  - §2.3 Mode A Workflow (lines 63-80)
+  - §3.1 HLR Definition rewrite (lines 96-155)
+  - §3.2 Architecture expansion (lines 156-180)
+  - §3.4 Derived Requirements (new section)
+  - §5.1 Schema docs (HLR table, source_inventory)
+
+- c:\Users\cruic\.gemini\antigravity\skills\do178c-dev\scripts\init_db.py
+  - HLR table: added is_derived, derivation_rationale, hlr_category
+  - NEW: source_inventory table
+  - NEW: indexes for source_inventory
+
+### Created:
+- c:\Users\cruic\.gemini\antigravity\skills\do178c-dev\scripts\scan_codebase.py
+  (~350 lines — Phase 1 source scanner)
+
+- c:\Users\cruic\.gemini\antigravity\skills\do178c-dev\scripts\check_progress.py
+  (~335 lines — Phase 6 progress dashboard)
+
+### Artifacts:
+- implementation_plan.md — Scalability analysis + pipeline proposal
+- task.md — Completed checklist
+- walkthrough.md — Summary of all changes
+
+================================================================================
+## NEXT STEPS (for the new repo)
+================================================================================
+
+1. Build derive_llrs.py — The core auto-generation engine
+   - AST-parse each file
+   - Extract function signatures, branches, error handlers
+   - Auto-generate LLR draft text with logic_type classification
+   - Populate low_level_requirements table
+
+2. Build cluster_hlrs.py — HLR grouping engine
+   - Analyze call graph / import relationships
+   - Group related functions into behavioral clusters
+   - Generate HLR candidate text
+
+3. Build gen_test_cases.py — Test skeleton generator
+   - For each HLR, generate Normal Range test case
+   - For each HLR, generate Robustness test case
+   - Populate hlr_test_cases table
+
+4. Add Rust support to all scripts
+
+5. Reduce SKILL.md to a simple orchestration guide:
+   "Run these scripts, review the output, validate"
+
+================================================================================
+## KEY DESIGN PRINCIPLE
+================================================================================
+
+"The script does the MECHANICAL work (enumeration, extraction, classification).
+ The agent does the JUDGMENT work (HLR naming, architecture rationale, review).
+ The DB enforces COMPLETENESS (every function must have an LLR)."
+
+This inverts the current model where the agent does everything.
+================================================================================
